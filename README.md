@@ -13,7 +13,7 @@ Returns structured, source-referenced analysis for human review, including uncer
 | Language | Python 3.12+ |
 | API | FastAPI, Uvicorn |
 | Validation | Pydantic |
-| Provider Client | HTTPX, OpenAI-compatible API |
+| Provider Client | Official Google Gen AI SDK, Gemini Developer API |
 | Dependencies | uv |
 
 ## Boundaries

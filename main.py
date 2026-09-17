@@ -6,19 +6,18 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import monotonic
-from typing import Annotated
-from urllib.parse import urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
-from pydantic import Field, ValidationError
+from google import genai
+from google.genai import errors, types
+from pydantic import ValidationError
 from starlette.requests import ClientDisconnect
 
 from schemas import (
     Analysis,
     AnalysisRequest,
     AnalysisResponse,
-    StrictModel,
     bound_context,
     load_json,
     validate_analysis,
@@ -76,7 +75,6 @@ metadata.
 
 @dataclass(frozen=True)
 class ProviderConfig:
-    base_url: str
     api_key: str = field(repr=False)
     model: str
     timeout: float
@@ -102,30 +100,21 @@ def authenticate(request: Request) -> None:
 
 
 def provider_config() -> ProviderConfig:
-    base_url = os.environ.get("AI_PROVIDER_BASE_URL", "https://api.openai.com/v1")
-    api_key = os.environ.get("AI_PROVIDER_API_KEY", "")
-    model = os.environ.get("AI_MODEL", "")
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     try:
-        url = urlsplit(base_url)
         timeout = float(os.environ.get("AI_REQUEST_TIMEOUT_SECONDS", "30"))
         if (
-            not valid_header_value(base_url, 2048)
-            or url.scheme != "https"
-            or not url.hostname
-            or url.username is not None
-            or url.password is not None
-            or url.query
-            or url.fragment
-            or (url.port is not None and url.port < 1)
-            or not valid_header_value(api_key)
+            not valid_header_value(api_key)
             or not valid_header_value(model, 200)
+            or not model.startswith("gemini-")
             or not math.isfinite(timeout)
             or not 0 < timeout <= 120
         ):
             raise ValueError("Invalid provider configuration")
     except ValueError:
         raise HTTPException(503, "AI provider is not configured") from None
-    return ProviderConfig(base_url.rstrip("/"), api_key, model, timeout)
+    return ProviderConfig(api_key, model, timeout)
 
 
 async def read_context(request: Request) -> AnalysisRequest:
@@ -163,110 +152,73 @@ async def read_context(request: Request) -> AnalysisRequest:
         ) from None
 
 
-class CompletionMessage(StrictModel):
-    model_config = {**StrictModel.model_config, "extra": "ignore"}
-    role: str
-    content: str
-    refusal: str | None = None
-    tool_calls: list[object] | None = None
-    function_call: dict[str, object] | None = None
-
-
-class CompletionChoice(StrictModel):
-    model_config = {**StrictModel.model_config, "extra": "ignore"}
-    finish_reason: str
-    message: CompletionMessage
-
-
-class Completion(StrictModel):
-    model_config = {**StrictModel.model_config, "extra": "ignore"}
-    model: Annotated[str, Field(min_length=1, max_length=200, pattern=r"^\S+$")]
-    choices: Annotated[list[CompletionChoice], Field(min_length=1, max_length=1)]
+def provider_client(
+    config: ProviderConfig,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> genai.Client:
+    async_client_args: dict[str, object] = {"trust_env": False, "follow_redirects": False}
+    if transport is not None:
+        async_client_args["transport"] = transport
+    return genai.Client(
+        api_key=config.api_key,
+        http_options=types.HttpOptions(
+            timeout=round(config.timeout * 1000),
+            client_args={"trust_env": False, "follow_redirects": False},
+            async_client_args=async_client_args,
+        ),
+    )
 
 
 async def call_provider(
     context: AnalysisRequest,
     config: ProviderConfig,
-    transport: httpx.AsyncBaseTransport | None,
+    transport: httpx.AsyncBaseTransport | None = None,
+    client: genai.Client | None = None,
 ) -> AnalysisResponse:
-    payload = {
-        "model": config.model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": context.model_dump_json(exclude={"caseId", "contextRevision"}),
-            },
-        ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "case_analysis",
-                "strict": True,
-                "schema": Analysis.model_json_schema(),
-            },
-        },
-        "stream": False,
-        "store": False,
-        "max_completion_tokens": 4096,
-    }
+    provider = client or provider_client(config, transport)
     try:
-        async with (
-            asyncio.timeout(config.timeout),
-            httpx.AsyncClient(
-                transport=transport,
-                timeout=httpx.Timeout(config.timeout),
-                follow_redirects=False,
-                trust_env=False,
-            ) as client,
-            client.stream(
-                "POST",
-                f"{config.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {config.api_key}",
-                    "Accept": "application/json",
-                    "Accept-Encoding": "identity",
-                },
-                json=payload,
-            ) as response,
-        ):
-            if response.status_code in (401, 403, 429):
-                raise HTTPException(503, "AI provider unavailable")
-            if response.status_code != 200:
-                raise HTTPException(502, "AI provider request failed")
-            if response.headers.get("content-encoding", "identity").lower() != "identity":
-                raise HTTPException(502, "Unsupported AI provider response encoding")
-            body = bytearray()
-            async for chunk in response.aiter_bytes(chunk_size=8192):
-                if len(body) + len(chunk) > MAX_PROVIDER_BYTES:
-                    raise HTTPException(502, "AI provider response exceeded limit")
-                body.extend(chunk)
+        async with asyncio.timeout(config.timeout):
+            response = await provider.aio.models.generate_content(
+                model=config.model,
+                contents=context.model_dump_json(exclude={"caseId", "contextRevision"}),
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    temperature=0,
+                    candidate_count=1,
+                    max_output_tokens=4096,
+                    response_mime_type="application/json",
+                    response_schema=Analysis,
+                ),
+            )
+    except errors.APIError as caught:
+        if caught.code in (401, 403, 429):
+            raise HTTPException(503, "AI provider unavailable") from None
+        if caught.code in (408, 504):
+            raise HTTPException(504, "AI provider timed out") from None
+        raise HTTPException(502, "AI provider request failed") from None
     except (httpx.TimeoutException, TimeoutError):
         raise HTTPException(504, "AI provider timed out") from None
     except httpx.HTTPError:
         raise HTTPException(502, "AI provider connection failed") from None
     try:
-        raw = bytes(body)
-        load_json(raw)
-        envelope = Completion.model_validate_json(raw)
-        choice = envelope.choices[0]
-        message = choice.message
+        candidates = response.candidates or []
+        message = response.text
         if (
-            choice.finish_reason != "stop"
-            or message.role != "assistant"
-            or message.refusal
-            or message.tool_calls
-            or message.function_call is not None
+            len(candidates) != 1
+            or candidates[0].finish_reason != types.FinishReason.STOP
+            or response.function_calls
+            or not message
+            or len(message.encode("utf-8")) > MAX_PROVIDER_BYTES
         ):
             raise ValueError("Incomplete or unsupported completion")
-        load_json(message.content)
-        result = Analysis.model_validate_json(message.content)
+        load_json(message)
+        result = Analysis.model_validate_json(message)
         validate_analysis(result, context)
         return AnalysisResponse(
             **result.model_dump(),
             caseId=context.caseId,
             contextRevision=context.contextRevision,
-            model=envelope.model,
+            model=response.model_version or config.model,
             generatedAt=datetime.now(UTC),
         )
     except (ValueError, ValidationError, RecursionError):
@@ -277,6 +229,8 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
     starts: deque[float] = deque()
     active = 0
+    provider: genai.Client | None = None
+    provider_settings: ProviderConfig | None = None
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -284,10 +238,13 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
 
     @app.post("/analyze", response_model=AnalysisResponse)
     async def analyze(request: Request, response: Response) -> AnalysisResponse:
-        nonlocal active
+        nonlocal active, provider, provider_settings
         authenticate(request)
         context = await read_context(request)
         config = provider_config()
+        if provider is None or provider_settings != config:
+            provider = provider_client(config, transport)
+            provider_settings = config
         now = monotonic()
         while starts and now - starts[0] >= 60:
             starts.popleft()
@@ -296,7 +253,7 @@ def create_app(transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
         starts.append(now)
         active += 1
         try:
-            result = await call_provider(context, config, transport)
+            result = await call_provider(context, config, client=provider)
         finally:
             active -= 1
         response.headers["Cache-Control"] = "no-store"
