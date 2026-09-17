@@ -2,6 +2,7 @@ import json
 import math
 import re
 import unicodedata
+from datetime import timedelta
 from typing import Annotated, Any, Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, model_validator
@@ -60,18 +61,102 @@ class SpatialSource(StrictModel):
         return self
 
 
+class WindForecast(StrictModel):
+    id: Identifier
+    provider: Literal["BMKG"]
+    regionId: Identifier
+    regionName: Text
+    issuedAt: AwareDatetime
+    validAt: AwareDatetime
+    fetchedAt: AwareDatetime
+
+
+class WindContext(StrictModel):
+    status: Literal[
+        "READY",
+        "CALM",
+        "MISSING_WIND",
+        "STALE",
+        "NOT_YET_VALID",
+        "INVALID",
+        "NO_FORECAST",
+        "NO_VERIFIED_REGION",
+    ]
+    evaluatedAt: AwareDatetime
+    usableUntil: AwareDatetime | None
+    forecast: WindForecast | None
+    windSpeedKmh: Annotated[float, Field(ge=0)] | None
+    windFromDegrees: Annotated[float, Field(ge=0, lt=360)] | None
+    windToDegrees: Annotated[float, Field(ge=0, lt=360)] | None
+    summary: Text
+    disclaimer: Literal["Downwind attention, not predicted perimeter"]
+    spatialExtent: None
+    settlementExposure: Literal["UNAVAILABLE"]
+    ruleVersion: Literal["wind-context-1"]
+
+    @model_validator(mode="after")
+    def wind_facts(self) -> Self:
+        if (self.windFromDegrees is None) != (self.windToDegrees is None):
+            raise ValueError("Incomplete direction pair")
+        if self.windFromDegrees is not None:
+            if self.windToDegrees != (self.windFromDegrees + 180) % 360:
+                raise ValueError("Wind-to must be opposite meteorological wind-from")
+        if self.status == "CALM" and (self.windSpeedKmh != 0 or self.windFromDegrees is not None):
+            raise ValueError("Calm wind has no direction")
+        if self.status == "READY":
+            f = self.forecast
+            if (
+                f is None
+                or self.usableUntil is None
+                or not self.windSpeedKmh
+                or self.windFromDegrees is None
+            ):
+                raise ValueError("Usable wind requires forecast, speed, direction and expiry")
+            if (
+                f.issuedAt > f.fetchedAt
+                or f.issuedAt > f.validAt
+                or f.fetchedAt > self.evaluatedAt
+                or f.validAt > self.evaluatedAt
+                or self.usableUntil
+                != min(
+                    f.validAt + timedelta(hours=3),
+                    f.issuedAt + timedelta(hours=24),
+                    f.fetchedAt + timedelta(hours=24),
+                )
+                or self.evaluatedAt >= self.usableUntil
+            ):
+                raise ValueError("Invalid usable wind times")
+        return self
+
+
 class AnalysisRequest(StrictModel):
     caseId: Identifier
     contextRevision: Annotated[int, Field(ge=0)]
     verificationStatus: Literal["UNVERIFIED", "CONFIRMED_FIRE", "NOT_FIRE"]
     observations: Annotated[list[Observation], Field(min_length=1, max_length=MAX_SOURCES)]
     weather: dict[str, JsonValue] | None
+    windContext: WindContext | None = None
     spatialContext: Annotated[list[SpatialSource], Field(max_length=MAX_SOURCES)]
     operationalContext: Annotated[list[dict[str, JsonValue]], Field(max_length=MAX_SOURCES)]
 
     @model_validator(mode="after")
     def source_identity(self) -> Self:
         sources = list(self.operationalContext)
+        if self.windContext is not None:
+            wind = self.windContext
+            if wind.status in ("READY", "CALM", "MISSING_WIND"):
+                if (
+                    wind.forecast is None
+                    or self.weather is None
+                    or wind.forecast.id != self.weather.get("id")
+                    or wind.windSpeedKmh != self.weather.get("windSpeed")
+                    or wind.windFromDegrees != self.weather.get("windFromDegrees")
+                    or wind.windToDegrees != self.weather.get("windToDegrees")
+                    or self.weather.get("windSpeedUnit") != "km/h"
+                ):
+                    raise ValueError("Wind context must match supplied weather")
+            elif self.weather is not None:
+                raise ValueError("Unusable wind cannot be supplied as current weather")
         if self.weather is not None:
             sources.append(self.weather)
         observation_ids = {observation.id for observation in self.observations}
@@ -178,6 +263,8 @@ DENIED = re.compile(
     r"|\bconfirmed\s+(?:fire|incident)\b|\bno\s+fire\b"
     r"|\b(?:all\s+clear|no\s+risk|safe\s+route|(?:area|village|road)\s+is\s+safe)\b"
     r"|\bsmoke\b[^.!?\n]{0,160}\b(?:arriv\w*|reach\w*|eta|\d+\s*(?:minutes?|hours?))\b"
+    r"|\b(?:fire|wildfire|flames?)\b[^.!?\n]{0,100}\b(?:spread|travel|arriv|reach|advance)\w*\b"
+    r"|\b(?:spread|propagation)\s+(?:speed|rate)\b"
     r"|\d+(?:\.\d+)?\s*%|<[^>]+>",
     re.IGNORECASE,
 )

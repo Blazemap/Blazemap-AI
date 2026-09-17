@@ -29,8 +29,8 @@ BODY_TIMEOUT_SECONDS = 10
 MAX_CONCURRENT = 4
 REQUESTS_PER_MINUTE = 30
 SCHEMA_VERSION = "2"
-PROMPT_VERSION = "2"
-RULE_VERSION = "2"
+PROMPT_VERSION = "2-wind-1"
+RULE_VERSION = "2-wind-1"
 
 SYSTEM_PROMPT = """You summarize supplied evidence for an internal human-reviewed fire
 investigation service. Return only the requested JSON schema. Use concise English; preserve official
@@ -67,9 +67,13 @@ exclude fire. Report count does not prove independence. Peat maps do not prove b
 not establish road usability, water availability, shelter suitability, or safety. Coordinates alone
 are not a confirmed incident location. Weather is a forecast, not a live sensor; preserve source
 time, wind-from/to semantics, units, uncertainty, and stale/unavailable states. Unknown or variable
-wind cannot support precise downwind claims. Include source and analytical limitations. Do not
-output HTML, extra fields, action commands, verification fields, publication fields, or invented
-metadata.
+wind cannot support precise downwind claims. windContext is caller-computed regional context;
+only READY supports directional attention. It never supports a spatial extent, spread speed,
+arrival time, burned area, or settlement exposure. Do not infer wildfire spread from wind alone.
+Unavailable, calm, stale, invalid or future wind cannot support downwind claims. Do not reinterpret
+windContext status or compute replacement bearings. Include source and analytical limitations.
+Do not output HTML, extra fields, action commands, verification fields, publication fields,
+or invented metadata.
 """
 
 
