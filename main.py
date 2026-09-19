@@ -173,6 +173,32 @@ def provider_client(
     )
 
 
+def provider_schema() -> dict[str, object]:
+    def simplify(value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: simplify(item)
+                for key, item in value.items()
+                if key
+                not in {
+                    "additionalProperties",
+                    "pattern",
+                    "minLength",
+                    "maxLength",
+                    "minItems",
+                    "maxItems",
+                }
+            }
+        if isinstance(value, list):
+            return [simplify(item) for item in value]
+        return value
+
+    result = simplify(Analysis.model_json_schema())
+    if not isinstance(result, dict):
+        raise TypeError("Provider schema must be an object")
+    return result
+
+
 async def call_provider(
     context: AnalysisRequest,
     config: ProviderConfig,
@@ -191,7 +217,7 @@ async def call_provider(
                     candidate_count=1,
                     max_output_tokens=4096,
                     response_mime_type="application/json",
-                    response_schema=Analysis,
+                    response_json_schema=provider_schema(),
                 ),
             )
     except errors.APIError as caught:
