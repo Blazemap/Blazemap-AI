@@ -28,6 +28,12 @@ class Observation(StrictModel):
     longitude: Annotated[float, Field(ge=-180, le=180)] | None = None
 
 
+class CoordinatePrecision(StrictModel):
+    decimalPlaces: Annotated[int, Field(ge=0, le=4)]
+    method: Literal["DECIMAL_ROUNDING"]
+    exactCoordinatesShared: Literal[False]
+
+
 class SpatialSource(StrictModel):
     model_config = ConfigDict(extra="allow", strict=True, allow_inf_nan=False)
     __pydantic_extra__: dict[str, JsonValue] = Field(init=False)
@@ -133,6 +139,7 @@ class AnalysisRequest(StrictModel):
     caseId: Identifier
     contextRevision: Annotated[int, Field(ge=0)]
     verificationStatus: Literal["UNVERIFIED", "CONFIRMED_FIRE", "NOT_FIRE"]
+    coordinatePrecision: CoordinatePrecision
     observations: Annotated[list[Observation], Field(min_length=1, max_length=MAX_SOURCES)]
     weather: dict[str, JsonValue] | None
     windContext: WindContext | None = None
