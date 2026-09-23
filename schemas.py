@@ -70,8 +70,10 @@ class SpatialSource(StrictModel):
 class WindForecast(StrictModel):
     id: Identifier
     provider: Literal["BMKG"]
-    regionId: Identifier
+    regionId: Identifier | None
     regionName: Text
+    selectionBasis: Literal["VERIFIED_ADMIN_REGION", "REVIEWED_WEATHER_REFERENCE"] | None = None
+    adm4: str | None = None
     issuedAt: AwareDatetime
     validAt: AwareDatetime
     fetchedAt: AwareDatetime
